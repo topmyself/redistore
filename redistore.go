@@ -6,7 +6,6 @@ package redistore
 
 import (
 	"bytes"
-	"encoding/base32"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -16,8 +15,8 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
-	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
+	uuid "github.com/satori/go.uuid"
 )
 
 // Amount of time for cookies/redis keys to expire.
@@ -84,7 +83,6 @@ func (s GobSerializer) Deserialize(d []byte, ss *sessions.Session) error {
 // RediStore stores sessions in a redis backend.
 type RediStore struct {
 	Pool          *redis.Pool
-	Codecs        []securecookie.Codec
 	Options       *sessions.Options // default configuration
 	DefaultMaxAge int               // default Redis TTL for a MaxAge == 0 session
 	maxLength     int
@@ -122,19 +120,9 @@ func (s *RediStore) SetSerializer(ss SessionSerializer) {
 //
 // Default is the one provided by this package value - `sessionExpire`.
 // Set it to 0 for no restriction.
-// Because we use `MaxAge` also in SecureCookie crypting algorithm you should
 // use this function to change `MaxAge` value.
 func (s *RediStore) SetMaxAge(v int) {
-	var c *securecookie.SecureCookie
-	var ok bool
 	s.Options.MaxAge = v
-	for i := range s.Codecs {
-		if c, ok = s.Codecs[i].(*securecookie.SecureCookie); ok {
-			c.MaxAge(v)
-		} else {
-			fmt.Printf("Can't change MaxAge on codec %v\n", s.Codecs[i])
-		}
-	}
 }
 
 func dial(network, address, password string) (redis.Conn, error) {
@@ -199,8 +187,7 @@ func NewRediStoreWithDB(size int, network, address, password, DB string, keyPair
 func NewRediStoreWithPool(pool *redis.Pool, keyPairs ...[]byte) (*RediStore, error) {
 	rs := &RediStore{
 		// http://godoc.org/github.com/gomodule/redigo/redis#Pool
-		Pool:   pool,
-		Codecs: securecookie.CodecsFromPairs(keyPairs...),
+		Pool: pool,
 		Options: &sessions.Options{
 			Path:   "/",
 			MaxAge: sessionExpire,
@@ -230,21 +217,26 @@ func (s *RediStore) Get(r *http.Request, name string) (*sessions.Session, error)
 //
 // See gorilla/sessions FilesystemStore.New().
 func (s *RediStore) New(r *http.Request, name string) (*sessions.Session, error) {
-	var (
-		err error
-		ok  bool
-	)
+
 	session := sessions.NewSession(s, name)
 	// make a copy
 	options := *s.Options
 	session.Options = &options
 	session.IsNew = true
-	if c, errCookie := r.Cookie(name); errCookie == nil {
-		err = securecookie.DecodeMulti(name, c.Value, &session.ID, s.Codecs...)
-		if err == nil {
-			ok, err = s.load(session)
-			session.IsNew = !(err == nil && ok) // not new if no error and data available
+
+	cookie, err := r.Cookie(name)
+	if err == nil {
+		sessionid := strings.TrimPrefix(cookie.String(), name+"="+s.keyPrefix)
+
+		// verify id
+		uid, uerr := uuid.FromString(sessionid)
+		if uerr != nil {
+			// 忽略先
+			fmt.Println(uid)
 		}
+		session.ID = sessionid
+		ok, err := s.load(session)
+		session.IsNew = !(err == nil && ok) // not new if no error and data available
 	}
 	return session, err
 }
@@ -260,16 +252,14 @@ func (s *RediStore) Save(r *http.Request, w http.ResponseWriter, session *sessio
 	} else {
 		// Build an alphanumeric key for the redis store.
 		if session.ID == "" {
-			session.ID = strings.TrimRight(base32.StdEncoding.EncodeToString(securecookie.GenerateRandomKey(32)), "=")
+			sid := uuid.NewV4()
+			session.ID = s.keyPrefix + sid.String()
 		}
 		if err := s.save(session); err != nil {
 			return err
 		}
-		encoded, err := securecookie.EncodeMulti(session.Name(), session.ID, s.Codecs...)
-		if err != nil {
-			return err
-		}
-		http.SetCookie(w, sessions.NewCookie(session.Name(), encoded, session.Options))
+
+		http.SetCookie(w, sessions.NewCookie(session.Name(), s.keyPrefix+session.ID, session.Options))
 	}
 	return nil
 }
